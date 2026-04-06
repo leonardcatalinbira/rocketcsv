@@ -14,7 +14,7 @@ import rocketcsv as csv
 
 That's it. Same `csv.reader()`, `csv.writer()`, `csv.DictReader`, `csv.DictWriter`. Same parameters. Same behavior. Faster.
 
-> **Status: v0.1.0-alpha.1** — functional drop-in with per-column string interning, raw ffi object creation, and a Rust file-path fast path. Performance mode with lazy Rust-backed rows is in development.
+> **Status: v0.1.0-alpha.1** — drop-in replacement with per-column string interning, raw ffi object creation, and a Rust file-path fast path. Includes performance mode (`fast_reader`) with lazy Rust-backed rows.
 
 ## Benchmarks
 
@@ -39,6 +39,20 @@ Reads and parses entirely in Rust, bypassing Python IO:
 | 100K quoted, 11 MB | 0.840s | 0.252s | **3.3x** |
 | 1M narrow, 16 MB | 1.273s | 0.263s | **4.8x** |
 | 5M rows, 456 MB | 7.89s | 3.09s | **2.6x** |
+
+### Performance mode (`rocketcsv.fast_reader()`)
+
+Returns lazy `RocketRow` objects — field data stays in Rust, PyString created only on `__getitem__` access. Cross-row string interning for repeated values.
+
+Tested on 456 MB (5M rows x 10 cols):
+
+| Access pattern | stdlib | fast_reader | Speedup |
+|----------------|--------|-------------|---------|
+| No field access (iterate only) | 17.93s | 9.61s | **1.9x** |
+| 3 of 10 columns | 8.65s | 7.10s | **1.2x** |
+| `fast_reader_from_path()`, 1 col filter | 21.74s | 7.12s | **3.1x** |
+
+Best for: file path reads, selective column access, filtering, row counting.
 
 Reproduce yourself:
 
@@ -79,6 +93,21 @@ for row in rocketcsv.reader_from_path("data.csv"):
     process(row)  # row is a regular list[str]
 ```
 
+### Performance mode (lazy Rust-backed rows)
+
+```python
+import rocketcsv
+
+# Fields stay in Rust — PyString created only when you access them
+for row in rocketcsv.fast_reader_from_path("data.csv"):
+    if row[2] == "IT":        # only this field is materialized
+        name = row[0]          # and this one
+        # row[1], row[3]..row[9] — never allocated, zero cost
+
+# RocketRow supports: indexing, len(), iteration, 'in', ==, repr()
+# list(row) converts to a regular list if needed
+```
+
 ### Full API surface
 
 | Feature | Status |
@@ -88,6 +117,8 @@ for row in rocketcsv.reader_from_path("data.csv"):
 | `DictReader` | Done |
 | `DictWriter` | Done |
 | `reader_from_path()` | Done (rocketcsv-only) |
+| `fast_reader()` | Done (performance mode) |
+| `fast_reader_from_path()` | Done (performance mode) |
 | Dialect support | Done |
 | All format parameters | Done |
 | `QUOTE_*` constants | Done |
@@ -128,6 +159,8 @@ python tests/corpus_runner.py       # Corpus validation
 - **Blank lines between records**: Handled differently from stdlib. 1 corpus file affected.
 - **Small files (<10K rows)**: PyO3 initialization overhead may make rocketcsv slower than stdlib. Gains appear at 50K+ rows.
 - **Wide tables (500+ columns)**: Writer is slower due to per-row builder overhead. Being optimized.
+- **`fast_reader` full materialization**: Accessing all fields via `row[i]` is slower than stdlib's pre-built `list[str]` due to per-access PyO3 dispatch. Use `fast_reader` for selective/filter patterns, use `reader` for full-row processing.
+- **`RocketRow` is not a `list`**: `isinstance(row, list)` returns `False`. Use `list(row)` to convert. Supports `len()`, indexing, iteration, `in`, `==`, `repr()`.
 
 ## Why Not Polars / PyArrow?
 

@@ -1,9 +1,11 @@
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyIndexError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyList, PyString};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -604,6 +606,304 @@ fn writer(
 }
 
 // ---------------------------------------------------------------------------
+// RocketRow — lazy Rust-backed row, creates PyString only on access
+// ---------------------------------------------------------------------------
+
+/// Shared cross-row intern cache. Rows hold Rc to this.
+struct SharedInternPool {
+    columns: Vec<HashMap<Box<[u8]>, Py<PyString>>>,
+    max_per_col: usize,
+}
+
+impl SharedInternPool {
+    fn new(max_per_col: usize) -> Self {
+        Self { columns: Vec::new(), max_per_col }
+    }
+
+    fn ensure_columns(&mut self, n: usize) {
+        while self.columns.len() < n {
+            self.columns.push(HashMap::with_capacity(64));
+        }
+    }
+
+    fn get_or_create(&mut self, py: Python<'_>, col: usize, field: &[u8]) -> Py<PyString> {
+        if let Some(cached) = self.columns[col].get(field) {
+            return cached.clone_ref(py);
+        }
+
+        let s = unsafe {
+            let ptr = ffi::PyUnicode_FromStringAndSize(
+                field.as_ptr() as *const _,
+                field.len() as ffi::Py_ssize_t,
+            );
+            Py::from_owned_ptr(py, ptr)
+        };
+
+        if self.columns[col].len() < self.max_per_col {
+            self.columns[col].insert(field.into(), s.clone_ref(py));
+        }
+
+        s
+    }
+}
+
+#[pyclass(unsendable)]
+struct RocketRow {
+    /// Compact storage: all field bytes concatenated.
+    data: Vec<u8>,
+    /// offsets[i] = byte start of field i. offsets[len] = end sentinel.
+    offsets: Vec<usize>,
+    /// Column indices (for interning).
+    col_count: usize,
+    /// Shared intern pool across all rows from the same reader.
+    pool: Rc<RefCell<SharedInternPool>>,
+    /// Lazily created PyString cache per field (None = not yet accessed).
+    py_cache: Vec<Option<Py<PyString>>>,
+}
+
+impl RocketRow {
+    fn field_bytes(&self, idx: usize) -> &[u8] {
+        &self.data[self.offsets[idx]..self.offsets[idx + 1]]
+    }
+
+    fn get_pystring(&mut self, py: Python<'_>, idx: usize) -> Py<PyString> {
+        if let Some(ref cached) = self.py_cache[idx] {
+            return cached.clone_ref(py);
+        }
+
+        let bytes = self.field_bytes(idx);
+        let s = self.pool.borrow_mut().get_or_create(py, idx, bytes);
+        self.py_cache[idx] = Some(s.clone_ref(py));
+        s
+    }
+}
+
+#[pymethods]
+impl RocketRow {
+    fn __len__(&self) -> usize {
+        self.col_count
+    }
+
+    fn __getitem__(&mut self, py: Python<'_>, idx: isize) -> PyResult<PyObject> {
+        let n = self.col_count as isize;
+        let actual = if idx < 0 { n + idx } else { idx };
+        if actual < 0 || actual >= n {
+            return Err(PyIndexError::new_err("list index out of range"));
+        }
+        Ok(self.get_pystring(py, actual as usize).into_any())
+    }
+
+    fn __iter__(slf: Bound<'_, Self>) -> PyResult<PyObject> {
+        // Return an iterator that yields fields in order
+        let py = slf.py();
+        let mut inner = slf.borrow_mut();
+        let n = inner.col_count;
+        let mut items: Vec<PyObject> = Vec::with_capacity(n);
+        for i in 0..n {
+            items.push(inner.get_pystring(py, i).into_any());
+        }
+        // Return a plain list iterator
+        let list = PyList::new_bound(py, &items);
+        Ok(list.call_method0("__iter__")?.unbind())
+    }
+
+    fn __contains__(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let target: String = value.extract()?;
+        let target_bytes = target.as_bytes();
+        for i in 0..self.col_count {
+            if self.field_bytes(i) == target_bytes {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn __eq__(&mut self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        // Support comparison with list[str]
+        if let Ok(other_list) = other.downcast::<PyList>() {
+            if other_list.len() != self.col_count {
+                return Ok(false);
+            }
+            for i in 0..self.col_count {
+                let other_str: String = other_list.get_item(i)?.extract()?;
+                if other_str.as_bytes() != self.field_bytes(i) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn __repr__(&mut self, py: Python<'_>) -> PyResult<String> {
+        let mut parts = Vec::with_capacity(self.col_count);
+        for i in 0..self.col_count {
+            let s = std::str::from_utf8(self.field_bytes(i))
+                .map_err(|e| PyTypeError::new_err(e.to_string()))?;
+            parts.push(format!("'{}'", s.replace('\'', "\\'")));
+        }
+        Ok(format!("[{}]", parts.join(", ")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FastReader — performance mode, yields lazy RocketRow
+// ---------------------------------------------------------------------------
+
+#[pyclass(unsendable)]
+struct FastReader {
+    inner: csv::Reader<Cursor<Vec<u8>>>,
+    byte_record: csv::ByteRecord,
+    line_num: usize,
+    skipinitialspace: bool,
+    yielded_any: bool,
+    total_bytes: usize,
+    pool: Rc<RefCell<SharedInternPool>>,
+}
+
+#[pymethods]
+impl FastReader {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        match self.inner.read_byte_record(&mut self.byte_record) {
+            Ok(true) => {
+                self.line_num += 1;
+                self.yielded_any = true;
+
+                let n = self.byte_record.len();
+                self.pool.borrow_mut().ensure_columns(n);
+
+                // Build compact row storage
+                let mut data = Vec::with_capacity(128);
+                let mut offsets = Vec::with_capacity(n + 1);
+
+                for field in self.byte_record.iter() {
+                    offsets.push(data.len());
+                    if self.skipinitialspace && field.first() == Some(&b' ') {
+                        data.extend_from_slice(&field[1..]);
+                    } else {
+                        data.extend_from_slice(field);
+                    }
+                }
+                offsets.push(data.len());
+
+                let py_cache: Vec<Option<Py<PyString>>> = (0..n).map(|_| None).collect();
+                let row = RocketRow {
+                    data,
+                    offsets,
+                    col_count: n,
+                    pool: Rc::clone(&self.pool),
+                    py_cache,
+                };
+
+                Ok(Some(Py::new(py, row)?.into_any()))
+            }
+            Ok(false) => {
+                if !self.yielded_any && self.total_bytes > 0 {
+                    self.yielded_any = true;
+                    self.line_num += 1;
+                    let row = RocketRow {
+                        data: Vec::new(),
+                        offsets: vec![0],
+                        col_count: 0,
+                        pool: Rc::clone(&self.pool),
+                        py_cache: Vec::new(),
+                    };
+                    return Ok(Some(Py::new(py, row)?.into_any()));
+                }
+                Ok(None)
+            }
+            Err(e) => Err(CsvError::new_err(e.to_string())),
+        }
+    }
+
+    #[getter]
+    fn line_num(&self) -> usize { self.line_num }
+}
+
+/// fast_reader from file path — performance mode.
+#[pyfunction]
+#[pyo3(signature = (path, delimiter=None, quotechar=None, doublequote=None, escapechar=None, quoting=None, skipinitialspace=None, strict=None))]
+fn fast_reader_from_path(
+    _py: Python<'_>, path: &str,
+    delimiter: Option<&str>, quotechar: Option<&str>,
+    doublequote: Option<bool>, escapechar: Option<&str>,
+    quoting: Option<u32>, skipinitialspace: Option<bool>, strict: Option<bool>,
+) -> PyResult<FastReader> {
+    let delim_byte = delimiter.map(|s| s.as_bytes()[0]);
+    let quote_byte = quotechar.map(|s| s.as_bytes()[0]);
+    let esc_byte = escapechar.map(|s| s.as_bytes()[0]);
+
+    let content = std::fs::read(path)
+        .map_err(|e| CsvError::new_err(format!("Cannot read {}: {}", path, e)))?;
+    let total_bytes = content.len();
+
+    let mut builder = csv::ReaderBuilder::new();
+    configure_reader_builder(&mut builder, delim_byte, quote_byte, doublequote, esc_byte, quoting);
+    builder.flexible(!strict.unwrap_or(false));
+
+    Ok(FastReader {
+        inner: builder.from_reader(Cursor::new(content)),
+        byte_record: csv::ByteRecord::new(),
+        line_num: 0,
+        skipinitialspace: skipinitialspace.unwrap_or(false),
+        yielded_any: false,
+        total_bytes,
+        pool: Rc::new(RefCell::new(SharedInternPool::new(8192))),
+    })
+}
+
+/// fast_reader from Python file/StringIO — performance mode.
+#[pyfunction]
+#[pyo3(signature = (csvfile, delimiter=None, quotechar=None, doublequote=None, escapechar=None, quoting=None, skipinitialspace=None, strict=None))]
+fn fast_reader(
+    py: Python<'_>, csvfile: Py<PyAny>,
+    delimiter: Option<&str>, quotechar: Option<&str>,
+    doublequote: Option<bool>, escapechar: Option<&str>,
+    quoting: Option<u32>, skipinitialspace: Option<bool>, strict: Option<bool>,
+) -> PyResult<FastReader> {
+    let delim_byte = delimiter.map(|s| s.as_bytes()[0]);
+    let quote_byte = quotechar.map(|s| s.as_bytes()[0]);
+    let esc_byte = escapechar.map(|s| s.as_bytes()[0]);
+
+    // Bulk-read content from Python
+    let content: Vec<u8> = if csvfile.bind(py).hasattr("read")? {
+        let text: String = csvfile.call_method0(py, "read")?.extract(py)?;
+        text.into_bytes()
+    } else {
+        // Iterable: collect all lines
+        let mut buf = Vec::new();
+        loop {
+            match csvfile.call_method0(py, "__next__") {
+                Ok(obj) => {
+                    let line: String = obj.extract(py)?;
+                    buf.extend_from_slice(line.as_bytes());
+                }
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        buf
+    };
+    let total_bytes = content.len();
+
+    let mut builder = csv::ReaderBuilder::new();
+    configure_reader_builder(&mut builder, delim_byte, quote_byte, doublequote, esc_byte, quoting);
+    builder.flexible(!strict.unwrap_or(false));
+
+    Ok(FastReader {
+        inner: builder.from_reader(Cursor::new(content)),
+        byte_record: csv::ByteRecord::new(),
+        line_num: 0,
+        skipinitialspace: skipinitialspace.unwrap_or(false),
+        yielded_any: false,
+        total_bytes,
+        pool: Rc::new(RefCell::new(SharedInternPool::new(8192))),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Module definition
 // ---------------------------------------------------------------------------
 
@@ -611,9 +911,13 @@ fn writer(
 fn _rocketcsv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(reader, m)?)?;
     m.add_function(wrap_pyfunction!(reader_from_path, m)?)?;
+    m.add_function(wrap_pyfunction!(fast_reader, m)?)?;
+    m.add_function(wrap_pyfunction!(fast_reader_from_path, m)?)?;
     m.add_function(wrap_pyfunction!(writer, m)?)?;
     m.add_class::<RocketReader>()?;
     m.add_class::<BulkReader>()?;
+    m.add_class::<FastReader>()?;
+    m.add_class::<RocketRow>()?;
     m.add_class::<RocketWriter>()?;
     m.add("Error", m.py().get_type_bound::<CsvError>())?;
     m.add("QUOTE_MINIMAL", 0u32)?;

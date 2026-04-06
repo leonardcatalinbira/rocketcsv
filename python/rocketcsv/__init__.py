@@ -10,6 +10,8 @@ from sys import intern as _intern
 from rocketcsv._rocketcsv import (
     reader,
     reader_from_path,
+    fast_reader,
+    fast_reader_from_path,
     writer,
     Error,
     QUOTE_MINIMAL,
@@ -262,6 +264,8 @@ __all__ = [
     "DictWriter",
     "reader",
     "reader_from_path",
+    "fast_reader",
+    "fast_reader_from_path",
     "writer",
     "register_dialect",
     "unregister_dialect",
