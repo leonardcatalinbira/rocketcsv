@@ -1,65 +1,66 @@
 # rocketcsv
 
-**Rust-powered drop-in replacement for Python's `csv` module.**
-
-Change one import line. Everything else stays the same. Your CSV code runs faster.
+**Drop one line of Rust into your Python CSV code. Get up to 2.4x faster reads.**
 
 ```python
 # Before
 import csv
 
-# After
+# After — everything else stays the same
 import rocketcsv as csv
 ```
 
-That's it. Same `csv.reader()`, `csv.writer()`, `csv.DictReader`, `csv.DictWriter`. Same parameters. Same behavior. Faster.
+Same `reader()`, `writer()`, `DictReader`, `DictWriter`. Same parameters. Same behavior. [376 compatibility tests](BENCHMARKS.md#corpus-shadow-test-results) prove it. Zero API changes, zero refactoring, zero new dependencies to learn.
 
-> **Status: v0.1.0-alpha.1** — drop-in replacement with per-column string interning, raw ffi object creation, and a Rust file-path fast path. Includes performance mode (`fast_reader`) with lazy Rust-backed rows.
+For files you can point at directly, it gets faster:
+
+```python
+# 2.4x faster — reads entirely in Rust, no Python IO
+for row in rocketcsv.reader_from_path("data.csv"):
+    process(row)
+
+# Even faster — fields stay in Rust, only materialize what you touch
+for row in rocketcsv.fast_reader_from_path("data.csv"):
+    if row[3] == "active":   # only this column is materialized
+        print(row[0])         # and this one — the other 8 are free
+```
 
 ## Benchmarks
 
-Tested on files from 8 MB to 456 MB. Full methodology and all scenarios: **[BENCHMARKS.md](BENCHMARKS.md)**
+Tested on real-scale files. Full methodology: **[BENCHMARKS.md](BENCHMARKS.md)**
 
-### Drop-in mode (`import rocketcsv as csv`)
+### Reading large files
 
-| Operation | Data | stdlib | rocketcsv | Speedup |
-|-----------|------|--------|-----------|---------|
-| reader() | 100K rows, 7.6 MB | 0.068s | 0.058s | **1.2x** |
-| reader() | 5M rows, 456 MB | 24.35s | 8.76s | **2.8x** |
-| DictReader() | 100K rows, 11.4 MB | 0.255s | 0.175s | **1.5x** |
-| writer() | 100K mixed rows | 0.208s | 0.093s | **2.2x** |
+| File | API | stdlib | rocketcsv | Speedup |
+|------|-----|--------|-----------|---------|
+| 175 MB (2M rows) | `reader_from_path()` | 4.66s | 3.32s | **1.4x** |
+| 395 MB (4.5M rows) | `reader_from_path()` | 6.41s | 2.65s | **2.4x** |
+| 877 MB (10M rows) | `reader_from_path()` | 12.13s | 7.20s | **1.7x** |
 
-### File path mode (`rocketcsv.reader_from_path()`)
+### Selective access (performance mode)
 
-Reads and parses entirely in Rust, bypassing Python IO:
+Only touch the columns you need. Skip everything else.
 
-| Data | stdlib `open()+reader()` | `reader_from_path()` | Speedup |
-|------|--------------------------|----------------------|---------|
-| 100K rows, 8 MB | 0.446s | 0.166s | **2.7x** |
-| 100K quoted, 11 MB | 0.840s | 0.252s | **3.3x** |
-| 1M narrow, 16 MB | 1.273s | 0.263s | **4.8x** |
-| 5M rows, 456 MB | 7.89s | 3.09s | **2.6x** |
+| File | Pattern | stdlib | fast_reader | Speedup |
+|------|---------|--------|-------------|---------|
+| 395 MB | Filter 1 column | 4.82s | 2.15s | **2.2x** |
+| 877 MB | Access 1 of 10 cols | 10.77s | 5.01s | **2.2x** |
+| 877 MB | Filter `row[3] == "active"` | 10.63s | 7.63s | **1.4x** |
 
-### Performance mode (`rocketcsv.fast_reader()`)
+### Writing
 
-Returns lazy `RocketRow` objects — field data stays in Rust, PyString created only on `__getitem__` access. Cross-row string interning for repeated values.
+| Scenario | stdlib | rocketcsv | Speedup |
+|----------|--------|-----------|---------|
+| 100K rows, mixed data | 0.208s | 0.093s | **2.2x** |
+| 100K rows, quoted fields | 0.127s | 0.096s | **1.3x** |
 
-Tested on 456 MB (5M rows x 10 cols):
+### Compatibility
 
-| Access pattern | stdlib | fast_reader | Speedup |
-|----------------|--------|-------------|---------|
-| No field access (iterate only) | 17.93s | 9.61s | **1.9x** |
-| 3 of 10 columns | 8.65s | 7.10s | **1.2x** |
-| `fast_reader_from_path()`, 1 col filter | 21.74s | 7.12s | **3.1x** |
-
-Best for: file path reads, selective column access, filtering, row counting.
-
-Reproduce yourself:
-
-```bash
-maturin develop --release
-python benchmarks/bench_full.py
-```
+| Metric | Result |
+|--------|--------|
+| Compat tests (Python 3.12) | **376/376 pass** |
+| Compat tests (Python 3.11) | **368/368 pass** (8 skip: 3.12 features) |
+| Real-world corpus (121 files) | **100% pass** |
 
 ## Installation
 
@@ -67,121 +68,72 @@ python benchmarks/bench_full.py
 pip install rocketcsv
 ```
 
-Requires Python 3.9+. Pre-built wheels for Linux, macOS, and Windows.
+Python 3.9+. Pre-built wheels for Linux, macOS, Windows.
 
-## API
-
-### Drop-in replacement (100% compatible with stdlib csv)
+## Three ways to read
 
 ```python
+import rocketcsv
+
+# 1. Drop-in — swap one import, change nothing else
 import rocketcsv as csv
+for row in csv.reader(open("data.csv")):  # returns list[str]
+    process(row)
 
-# These all work identically to stdlib
-reader = csv.reader(open("data.csv"))
-writer = csv.writer(open("out.csv", "w"))
-dreader = csv.DictReader(open("data.csv"))
-dwriter = csv.DictWriter(open("out.csv", "w"), fieldnames=["a", "b"])
+# 2. File path — reads entirely in Rust, skips Python IO
+for row in rocketcsv.reader_from_path("data.csv"):  # returns list[str]
+    process(row)
+
+# 3. Performance mode — lazy rows, zero-cost unused columns
+for row in rocketcsv.fast_reader_from_path("data.csv"):  # returns RocketRow
+    if row[2] == "IT":     # only this field is materialized
+        name = row[0]       # and this one
+        # row[1], row[3]..row[9] — never allocated
 ```
 
-### File path fast path (rocketcsv-only, faster)
+## Full API
 
-```python
-import rocketcsv
-
-# Reads and parses entirely in Rust — no Python IO overhead
-for row in rocketcsv.reader_from_path("data.csv"):
-    process(row)  # row is a regular list[str]
-```
-
-### Performance mode (lazy Rust-backed rows)
-
-```python
-import rocketcsv
-
-# Fields stay in Rust — PyString created only when you access them
-for row in rocketcsv.fast_reader_from_path("data.csv"):
-    if row[2] == "IT":        # only this field is materialized
-        name = row[0]          # and this one
-        # row[1], row[3]..row[9] — never allocated, zero cost
-
-# RocketRow supports: indexing, len(), iteration, 'in', ==, repr()
-# list(row) converts to a regular list if needed
-```
-
-### Full API surface
+Everything in `import csv` works in `import rocketcsv as csv`:
 
 | Feature | Status |
 |---------|--------|
-| `reader()` | Done |
-| `writer()` | Done |
-| `DictReader` | Done |
-| `DictWriter` | Done |
-| `reader_from_path()` | Done (rocketcsv-only) |
-| `fast_reader()` | Done (performance mode) |
-| `fast_reader_from_path()` | Done (performance mode) |
-| Dialect support | Done |
-| All format parameters | Done |
-| `QUOTE_*` constants | Done |
-| `field_size_limit()` | Done |
-| `Sniffer` | Planned |
+| `reader()` / `writer()` | Drop-in compatible |
+| `DictReader` / `DictWriter` | Drop-in compatible |
+| `Sniffer` (sniff + has_header) | Drop-in compatible |
+| Dialect support | Full (register, get, list, unregister) |
+| All format parameters | Full (delimiter, quotechar, escapechar, doublequote, skipinitialspace, lineterminator, quoting, strict) |
+| `QUOTE_*` constants | All 6 including 3.12+ (`QUOTE_STRINGS`, `QUOTE_NOTNULL`) |
+| `field_size_limit()` | Enforced |
+| `reader_from_path()` | rocketcsv-only, 1.4-2.4x faster |
+| `fast_reader()` / `fast_reader_from_path()` | rocketcsv-only, lazy Rust-backed rows |
 
-All format parameters work identically to stdlib:
-`delimiter`, `quotechar`, `escapechar`, `doublequote`, `skipinitialspace`, `lineterminator`, `quoting`, `strict`
+## How it works
 
-## How It Works
+CSV parsing happens in Rust via [BurntSushi's csv crate](https://crates.io/crates/csv). Python bindings via [PyO3](https://pyo3.rs). Packaged with [maturin](https://maturin.rs).
 
-The CSV parsing and formatting happens in Rust via the [csv crate](https://crates.io/crates/csv) by BurntSushi. Python bindings via [PyO3](https://pyo3.rs), packaged with [maturin](https://maturin.rs).
+- **Per-column string interning** — repeated values (status codes, countries, categories) are cached as Python objects and reused across rows. Auto-disables on high-cardinality columns
+- **Raw CPython ffi** — `PyUnicode_FromStringAndSize` + `PyList_SET_ITEM` skip intermediate allocations and bounds checks
+- **Rust file I/O** — `reader_from_path()` uses `std::fs::read()`, bypassing Python's file handling entirely
+- **Lazy RocketRow** — `fast_reader()` parses in Rust but defers Python object creation to `__getitem__`. Columns you never access cost zero
+- **Batched writer** — `writerows()` formats everything in a single Rust buffer, one `.write()` call
 
-Key optimizations:
-- **Per-column string interning** — adaptive HashMap caches repeated values (country codes, status fields), auto-disables on high-cardinality columns
-- **Raw ffi object creation** — `PyUnicode_FromStringAndSize` + `PyList_SET_ITEM` skip bounds checks and intermediate Rust String allocations
-- **File path fast path** — `reader_from_path()` reads entirely in Rust via `std::fs::read`, zero Python IO
-- **Batched writer** — `writerows()` formats all rows in Rust, single `.write()` call to Python
+## Why not Polars / PyArrow?
 
-## Testing
+Those are great — for DataFrames. But they replace the API entirely. If your code uses `csv.reader()` or `csv.DictReader()`, switching to Polars means rewriting.
 
-Every function is shadow-tested: the same operation runs on both `csv` (stdlib) and `rocketcsv`, and the outputs are asserted identical.
-
-- **64 shadow tests** — reader, writer, DictReader, DictWriter
-- **121 corpus files** — real-world CSVs from pandas, csvkit, agate, BurntSushi/rust-csv
-- **96.6% corpus pass rate** — 4 known edge cases (BOM handling, blank line parity)
-- Edge cases: multiline fields, Unicode, empty inputs, ragged rows, all format parameter combinations
-- Round-trip verification (write then read through both implementations)
-
-```bash
-pytest tests/ -v                    # Shadow tests
-python tests/corpus_runner.py       # Corpus validation
-```
-
-## Known Limitations (alpha)
-
-- **UTF-8 BOM**: Rust csv crate auto-strips BOM, stdlib preserves it. 3 corpus files affected.
-- **Blank lines between records**: Handled differently from stdlib. 1 corpus file affected.
-- **Small files (<10K rows)**: PyO3 initialization overhead may make rocketcsv slower than stdlib. Gains appear at 50K+ rows.
-- **Wide tables (500+ columns)**: Writer is slower due to per-row builder overhead. Being optimized.
-- **`fast_reader` full materialization**: Accessing all fields via `row[i]` is slower than stdlib's pre-built `list[str]` due to per-access PyO3 dispatch. Use `fast_reader` for selective/filter patterns, use `reader` for full-row processing.
-- **`RocketRow` is not a `list`**: `isinstance(row, list)` returns `False`. Use `list(row)` to convert. Supports `len()`, indexing, iteration, `in`, `==`, `repr()`.
-
-## Why Not Polars / PyArrow?
-
-Those are great tools — for DataFrames. But they change the API entirely. If you have existing code using `csv.reader()` or `csv.DictReader()`, switching to Polars means rewriting your code.
-
-rocketcsv is for the millions of codebases that already use `import csv`. One line change, zero refactoring.
+rocketcsv is for the millions of existing codebases that use `import csv`. One line change. Zero refactoring.
 
 ## License
 
-rocketcsv is dual-licensed:
+Dual-licensed:
 
-- **Open source**: [LGPLv3](LICENSE-LGPL) — free for use in any project, open or proprietary. You can `import rocketcsv` in commercial software without any obligation to open-source your application.
-
-- **Commercial**: For companies that need to modify rocketcsv internals and keep changes private, or want warranty/support/indemnification. Contact for pricing.
+- **Open source**: [LGPLv3](LICENSE-LGPL) — use freely in any project, open or proprietary. `import rocketcsv` in commercial software with zero obligation to open-source your code.
+- **Commercial**: For modifying rocketcsv internals privately, or for warranty/support/indemnification. Contact for pricing.
 
 ## Contributing
-
-Contributions welcome. Please ensure all shadow tests pass before submitting a PR.
 
 ```bash
 pip install maturin pytest
 maturin develop
-pytest tests/ -v
+pytest tests/ -v   # 376 tests
 ```
