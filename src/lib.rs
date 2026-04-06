@@ -3,7 +3,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -348,11 +348,13 @@ impl RocketReader {
 
 #[pyclass(unsendable)]
 struct BulkReader {
-    records: Vec<csv::StringRecord>,
-    pos: usize,
+    inner: csv::Reader<Cursor<Vec<u8>>>,
+    record: csv::StringRecord,
+    total_bytes: usize,
     line_num: usize,
     quote_nonnumeric: bool,
     skipinitialspace: bool,
+    yielded_any: bool,
     pool: StringInternPool,
     field_ptrs: Vec<*mut ffi::PyObject>,
 }
@@ -362,41 +364,57 @@ impl BulkReader {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        if self.pos >= self.records.len() {
-            return Ok(None);
-        }
+        match self.inner.read_record(&mut self.record) {
+            Ok(true) => {
+                self.line_num += 1;
+                self.yielded_any = true;
 
-        let record = &self.records[self.pos];
-        self.pos += 1;
-        self.line_num += 1;
+                let n = self.record.len();
+                self.pool.ensure_columns(n);
+                self.field_ptrs.clear();
 
-        let n = record.len();
-        self.pool.ensure_columns(n);
-        self.field_ptrs.clear();
-
-        for (i, field) in record.iter().enumerate() {
-            let f = if self.skipinitialspace {
-                field.strip_prefix(' ').unwrap_or(field)
-            } else { field };
-            if self.quote_nonnumeric {
-                match f.parse::<f64>() {
-                    Ok(num) => {
-                        let ptr = unsafe { ffi::PyFloat_FromDouble(num) };
-                        self.field_ptrs.push(ptr);
+                if self.quote_nonnumeric {
+                    for (i, field) in self.record.iter().enumerate() {
+                        let f = if self.skipinitialspace {
+                            field.strip_prefix(' ').unwrap_or(field)
+                        } else { field };
+                        match f.parse::<f64>() {
+                            Ok(num) => {
+                                let ptr = unsafe { ffi::PyFloat_FromDouble(num) };
+                                self.field_ptrs.push(ptr);
+                            }
+                            Err(_) => {
+                                let ptr = unsafe { self.pool.get_or_create(i, f.as_bytes()) };
+                                self.field_ptrs.push(ptr);
+                            }
+                        }
                     }
-                    Err(_) => {
+                } else {
+                    for (i, field) in self.record.iter().enumerate() {
+                        let f = if self.skipinitialspace {
+                            field.strip_prefix(' ').unwrap_or(field)
+                        } else { field };
                         let ptr = unsafe { self.pool.get_or_create(i, f.as_bytes()) };
                         self.field_ptrs.push(ptr);
                     }
                 }
-            } else {
-                let ptr = unsafe { self.pool.get_or_create(i, f.as_bytes()) };
-                self.field_ptrs.push(ptr);
-            }
-        }
 
-        let list = unsafe { fast_list_from_ptrs(py, &self.field_ptrs) };
-        Ok(Some(list))
+                let list = unsafe { fast_list_from_ptrs(py, &self.field_ptrs) };
+                Ok(Some(list))
+            }
+            Ok(false) => {
+                if !self.yielded_any && self.total_bytes > 0 {
+                    self.yielded_any = true;
+                    self.line_num += 1;
+                    return Ok(Some(
+                        PyList::new_bound(py, Vec::<PyObject>::new().as_slice())
+                            .into_any().unbind(),
+                    ));
+                }
+                Ok(None)
+            }
+            Err(e) => Err(CsvError::new_err(e.to_string())),
+        }
     }
 
     #[getter]
@@ -542,26 +560,24 @@ fn reader_from_path(
     let quote_byte = quotechar.map(|s| s.as_bytes()[0]);
     let esc_byte = escapechar.map(|s| s.as_bytes()[0]);
 
-    let content = std::fs::read_to_string(path)
+    let content = std::fs::read(path)
         .map_err(|e| CsvError::new_err(format!("Cannot read {}: {}", path, e)))?;
+    let total_bytes = content.len();
 
     let mut builder = csv::ReaderBuilder::new();
     configure_reader_builder(&mut builder, delim_byte, quote_byte, doublequote, esc_byte, quoting);
     builder.flexible(!strict.unwrap_or(false));
 
-    let mut rdr = builder.from_reader(content.as_bytes());
-    let mut records: Vec<csv::StringRecord> = Vec::new();
-    for result in rdr.records() {
-        records.push(result.map_err(|e| CsvError::new_err(e.to_string()))?);
-    }
-    if records.is_empty() && !content.is_empty() {
-        records.push(csv::StringRecord::new());
-    }
+    let csv_reader = builder.from_reader(Cursor::new(content));
 
     Ok(BulkReader {
-        records, pos: 0, line_num: 0,
+        inner: csv_reader,
+        record: csv::StringRecord::new(),
+        total_bytes,
+        line_num: 0,
         quote_nonnumeric: quoting == Some(2),
         skipinitialspace: skipinitialspace.unwrap_or(false),
+        yielded_any: false,
         pool: StringInternPool::new(py, 8192),
         field_ptrs: Vec::with_capacity(32),
     })
