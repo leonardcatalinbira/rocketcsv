@@ -12,52 +12,61 @@ import rocketcsv as csv
 
 Same `reader()`, `writer()`, `DictReader`, `DictWriter`. Same parameters. Same behavior. [376 compatibility tests](BENCHMARKS.md#corpus-shadow-test-results) prove it.
 
-**Pass a file path instead of a file object — rocketcsv reads it entirely in Rust:**
+## Benchmarks
+
+Three levels of speed, depending on how much code you want to change. Tested up to 877 MB. Full details: **[BENCHMARKS.md](BENCHMARKS.md)**
+
+### Level 1 — Change one import line (zero other code changes)
 
 ```python
-import rocketcsv as csv
+import rocketcsv as csv          # swap this one line
 
-# Pass a path string → auto-detects, reads in Rust (1.7-2.4x faster)
-for row in csv.reader("data.csv"):
-    process(row)
-
-# Still works the classic way too (1.2-1.3x faster)
-with open("data.csv") as f:
+with open("data.csv") as f:     # your existing code, untouched
     for row in csv.reader(f):
         process(row)
 ```
 
-One import change for an instant speedup. Pass a file path for the full Rust fast path. Same function, same API.
-
-## Benchmarks
-
-Tested on real-scale files up to 877 MB. Full methodology: **[BENCHMARKS.md](BENCHMARKS.md)**
-
-### Drop-in mode (`import rocketcsv as csv`)
-
-Zero code changes. Swap the import, get faster reads and writes.
-
 | Scenario | Rows | stdlib | rocketcsv | Speedup |
 |----------|------|--------|-----------|---------|
-| reader() 100K rows, simple | 100K | 0.068s | 0.058s | **1.2x** |
-| reader() 100K rows, quoted | 100K | 0.127s | 0.096s | **1.3x** |
-| reader() 100K rows, mixed | 100K | 0.144s | 0.115s | **1.2x** |
-| DictReader() 100K, quoted | 100K | 0.255s | 0.175s | **1.5x** |
-| writer() 100K, mixed data | 100K | 0.208s | 0.093s | **2.2x** |
+| reader(), simple data | 100K | 0.068s | 0.058s | **1.2x** |
+| reader(), quoted fields | 100K | 0.127s | 0.096s | **1.3x** |
+| reader(), mixed types | 100K | 0.144s | 0.115s | **1.2x** |
+| DictReader(), quoted | 100K | 0.255s | 0.175s | **1.5x** |
+| writer(), mixed data | 100K | 0.208s | 0.093s | **2.2x** |
 
-### File path mode (`reader_from_path`)
+### Level 2 — Pass a file path instead of a file object
 
-One line of code change. Reads and parses entirely in Rust.
+rocketcsv extends `reader()` to accept a string path. When it sees a path, it reads the file entirely in Rust — no Python file handling overhead. This is **not** how stdlib `csv.reader()` works (stdlib requires a file object), but it's one small code change:
 
-| File | Rows | stdlib `open()+reader()` | `reader_from_path()` | Speedup |
-|------|------|--------------------------|----------------------|---------|
+```python
+import rocketcsv as csv
+
+# Before (stdlib-compatible):
+# with open("data.csv") as f:
+#     for row in csv.reader(f):
+
+# After (rocketcsv extension — pass path directly):
+for row in csv.reader("data.csv"):
+    process(row)
+```
+
+| File | Rows | stdlib `open()+reader()` | rocketcsv `reader(path)` | Speedup |
+|------|------|--------------------------|--------------------------|---------|
 | 175 MB | 2,000,000 | 4.66s | 3.32s | **1.4x** |
 | 395 MB | 4,500,000 | 6.41s | 2.65s | **2.4x** |
 | 877 MB | 10,000,000 | 12.13s | 7.20s | **1.7x** |
 
-### Performance mode (`fast_reader_from_path`)
+### Level 3 — Performance mode (lazy Rust-backed rows)
 
-Lazy Rust-backed rows. Only touch the columns you need, skip everything else.
+`fast_reader_from_path()` returns `RocketRow` objects instead of `list[str]`. Field data stays in Rust — a PyString is only created when you access `row[i]`. Columns you never touch cost zero.
+
+```python
+import rocketcsv
+
+for row in rocketcsv.fast_reader_from_path("data.csv"):
+    if row[3] == "active":   # only this column is materialized
+        print(row[0])         # and this one — the other 8 are free
+```
 
 | File | Pattern | stdlib | fast_reader | Speedup |
 |------|---------|--------|-------------|---------|
