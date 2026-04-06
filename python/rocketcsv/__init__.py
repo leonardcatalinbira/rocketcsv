@@ -96,17 +96,31 @@ def _make_dialect_obj(kwargs):
 
 class _ReaderWrapper:
     """Thin wrapper adding dialect attribute to Rust reader."""
-    __slots__ = ("_inner", "dialect")
+    __slots__ = ("_inner", "dialect", "_first_row", "_has_bom")
 
-    def __init__(self, inner, dialect_obj):
+    def __init__(self, inner, dialect_obj, has_bom=False):
         self._inner = inner
         self.dialect = dialect_obj
+        self._first_row = True
+        self._has_bom = has_bom
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        return next(self._inner)
+        row = next(self._inner)
+        # Re-prepend BOM to first field if input had BOM
+        # (Rust csv crate auto-strips it, stdlib preserves it)
+        if self._first_row:
+            self._first_row = False
+            if self._has_bom and row:
+                row[0] = "\ufeff" + row[0]
+        # Check field_size_limit
+        limit = _field_size_limit
+        for field in row:
+            if len(field) > limit:
+                raise Error("field larger than field limit (%d)" % limit)
+        return row
 
     @property
     def line_num(self):
@@ -249,8 +263,100 @@ def reader(csvfile, dialect=None, **fmtparams):
     # Remove params that Rust reader doesn't accept
     kwargs.pop("lineterminator", None)
     kwargs.pop("strict", None)
+
+    # Pre-process: detect BOM and handle blank lines.
+    # The Rust csv crate auto-strips BOM and skips blank lines — stdlib doesn't.
+    # Read content and pre-process if needed.
+    has_bom = False
+    if hasattr(csvfile, 'read'):
+        content = csvfile.read()
+        if content.startswith("\ufeff"):
+            has_bom = True
+        # Insert sentinel for blank lines so Rust crate doesn't skip them.
+        # Sentinel: a line containing only \x00 — recognized in _ReaderWrapper.
+        if "\n\n" in content or "\r\n\r\n" in content or content.startswith("\n") or content.startswith("\r\n"):
+            content = _insert_blank_line_sentinels(content)
+        csvfile = StringIO(content)
+    elif hasattr(csvfile, '__iter__'):
+        # For iterables (lists, generators), wrap to detect BOM and blank lines
+        items = list(csvfile)
+        if items:
+            first = items[0]
+            if isinstance(first, str) and first.startswith("\ufeff"):
+                has_bom = True
+        csvfile = iter(items)
+
     r = _reader_rust(csvfile, **kwargs)
-    return _ReaderWrapper(r, dialect_obj)
+    return _BlankLineReaderWrapper(r, dialect_obj, has_bom)
+
+
+_BLANK_SENTINEL = "\x00"
+
+
+def _insert_blank_line_sentinels(text):
+    """Replace blank lines with sentinel rows, respecting quoted fields.
+
+    A blank line is one that contains no data between newline sequences.
+    Sentinels are inserted so the Rust csv crate doesn't skip them.
+    """
+    # Split into lines preserving the line endings, then reassemble
+    # with sentinels for blank lines. Must respect quoted fields.
+    result = []
+    in_quote = False
+    line_has_content = False
+    i = 0
+
+    # If text starts with a newline, the first line is blank
+    if text and text[0] in ('\r', '\n'):
+        result.append(_BLANK_SENTINEL)
+        line_has_content = True  # sentinel counts as content
+
+    while i < len(text):
+        c = text[i]
+        if c == '"' and not in_quote:
+            in_quote = True
+            result.append(c)
+            line_has_content = True
+        elif c == '"' and in_quote:
+            if i + 1 < len(text) and text[i + 1] == '"':
+                result.append(c)
+                result.append('"')
+                i += 2
+                continue
+            else:
+                in_quote = False
+                result.append(c)
+        elif not in_quote and c in ('\r', '\n'):
+            # Emit the newline
+            if c == '\r' and i + 1 < len(text) and text[i + 1] == '\n':
+                result.append('\r')
+                result.append('\n')
+                i += 2
+            else:
+                result.append(c)
+                i += 1
+            # Check if next line is blank (starts with newline or is EOF)
+            if i < len(text) and text[i] in ('\r', '\n'):
+                # Next line is blank — insert sentinel
+                result.append(_BLANK_SENTINEL)
+            line_has_content = False
+            continue
+        else:
+            result.append(c)
+            line_has_content = True
+        i += 1
+    return ''.join(result)
+
+
+class _BlankLineReaderWrapper(_ReaderWrapper):
+    """Extends _ReaderWrapper to convert sentinel rows back to empty rows."""
+
+    def __next__(self):
+        row = super().__next__()
+        # Convert sentinel rows back to empty rows
+        if len(row) == 1 and row[0] == _BLANK_SENTINEL:
+            return []
+        return row
 
 
 class _StdlibReaderWrapper:

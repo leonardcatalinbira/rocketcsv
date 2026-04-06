@@ -300,7 +300,8 @@ impl RocketReader {
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         match self.inner.read_record(&mut self.record) {
             Ok(true) => {
-                self.line_num += 1;
+                // Use csv crate's position for physical line count (matches stdlib)
+                self.line_num = self.inner.position().line() as usize;
                 self.yielded_any = true;
 
                 let n = self.record.len();
@@ -382,7 +383,7 @@ impl BulkReader {
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         match self.inner.read_record(&mut self.record) {
             Ok(true) => {
-                self.line_num += 1;
+                self.line_num = self.inner.position().line() as usize;
                 self.yielded_any = true;
 
                 let n = self.record.len();
