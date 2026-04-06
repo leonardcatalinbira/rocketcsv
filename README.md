@@ -47,12 +47,23 @@ Only touch the columns you need. Skip everything else.
 | 877 MB | Access 1 of 10 cols | 10.77s | 5.01s | **2.2x** |
 | 877 MB | Filter `row[3] == "active"` | 10.63s | 7.63s | **1.4x** |
 
-### Writing
+### Writing — drop-in, same `csv.writer()` API
 
-| Scenario | stdlib | rocketcsv | Speedup |
-|----------|--------|-----------|---------|
-| 100K rows, mixed data | 0.208s | 0.093s | **2.2x** |
-| 100K rows, quoted fields | 0.127s | 0.096s | **1.3x** |
+`writerows()` batches all formatting in Rust, then writes to your file in a single call.
+
+```python
+import rocketcsv as csv
+
+with open("out.csv", "w", newline="") as f:
+    w = csv.writer(f)            # same API, nothing new to learn
+    w.writerows(rows)            # 2.2x faster on mixed data
+```
+
+| Scenario | Rows | stdlib | rocketcsv | Speedup |
+|----------|------|--------|-----------|---------|
+| Mixed types (strings, numbers, dates) | 100K | 0.208s | 0.093s | **2.2x** |
+| Quoted fields (commas, newlines in data) | 100K | 0.127s | 0.096s | **1.3x** |
+| Narrow table (2 cols, high row count) | 1M | 0.234s | 0.158s | **1.5x** |
 
 ### Compatibility
 
