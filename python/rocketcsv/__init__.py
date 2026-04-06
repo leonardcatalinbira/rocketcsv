@@ -75,7 +75,10 @@ def _validate_params(kwargs):
         if len(e) != 1:
             raise TypeError('"escapechar" must be a 1-character string')
     quoting = kwargs.get("quoting")
-    if quoting is not None and quoting not in (QUOTE_MINIMAL, QUOTE_ALL, QUOTE_NONNUMERIC, QUOTE_NONE):
+    if quoting is not None and quoting not in (
+        QUOTE_MINIMAL, QUOTE_ALL, QUOTE_NONNUMERIC, QUOTE_NONE,
+        QUOTE_STRINGS, QUOTE_NOTNULL,
+    ):
         raise TypeError("bad 'quoting' value")
 
 
@@ -136,8 +139,9 @@ class _WriterWrapper:
     #   1 = QUOTE_NONE with no escapechar (raise on special chars)
     #   2 = QUOTE_NONE with escapechar (manual escape, no quoting)
     #   3 = doublequote=False with escapechar (manual escape-in-quotes)
-
-    # _mode 4 = multi-char lineterminator (manual formatting needed)
+    #   4 = multi-char lineterminator (manual formatting needed)
+    #   5 = QUOTE_STRINGS (quote only str fields)
+    #   6 = QUOTE_NOTNULL (quote everything except None)
 
     def __init__(self, inner, dialect_obj, file_obj):
         self._inner = inner
@@ -152,6 +156,10 @@ class _WriterWrapper:
             self._mode = 1
         elif not d.doublequote and d.escapechar is not None:
             self._mode = 3
+        elif d.quoting == QUOTE_STRINGS:
+            self._mode = 5
+        elif d.quoting == QUOTE_NOTNULL:
+            self._mode = 6
         elif multichar_lt:
             self._mode = 4
         else:
@@ -210,6 +218,30 @@ class _WriterWrapper:
         line = d.delimiter.join(fields) + d.lineterminator
         return self._file.write(line)
 
+    def _manual_writerow_typed(self, row):
+        """Mode 5/6: type-aware quoting (QUOTE_STRINGS / QUOTE_NOTNULL)."""
+        d = self.dialect
+        q = d.quotechar or '"'
+        fields = []
+        for field in row:
+            if field is None:
+                # None → empty string, never quoted (both modes)
+                fields.append("")
+            elif self._mode == 5:
+                # QUOTE_STRINGS: quote str fields, leave others raw
+                if isinstance(field, str):
+                    s = field.replace(q, q + q) if d.doublequote else field
+                    fields.append(q + s + q)
+                else:
+                    fields.append(str(field))
+            else:
+                # QUOTE_NOTNULL: quote everything except None
+                s = str(field)
+                s = s.replace(q, q + q) if d.doublequote else s
+                fields.append(q + s + q)
+        line = d.delimiter.join(fields) + d.lineterminator
+        return self._file.write(line)
+
     def writerow(self, row):
         if self._mode == 1:
             # QUOTE_NONE, no escapechar — check for chars that need escaping
@@ -228,6 +260,8 @@ class _WriterWrapper:
             return self._manual_writerow(row)
         elif self._mode == 4:
             return self._manual_writerow_quoteall(row)
+        elif self._mode in (5, 6):
+            return self._manual_writerow_typed(row)
         else:
             return self._inner.writerow(row)
 
@@ -802,6 +836,9 @@ def field_size_limit(new_limit=None):
 class DictReader:
     """CSV reader that maps rows to dicts. Drop-in for csv.DictReader."""
 
+    def __class_getitem__(cls, item):
+        return cls
+
     def __init__(
         self,
         f,
@@ -871,6 +908,9 @@ class DictReader:
 
 class DictWriter:
     """CSV writer that maps dicts to rows. Drop-in for csv.DictWriter."""
+
+    def __class_getitem__(cls, item):
+        return cls
 
     def __init__(
         self,
