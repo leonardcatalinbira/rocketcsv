@@ -94,10 +94,11 @@ with open("out.csv", "w", newline="") as f:
 ## Installation
 
 ```bash
-pip install rocketcsv
+# From GitHub (requires Rust toolchain)
+pip install git+https://github.com/leonardcatalinbira/rocketcsv.git
 ```
 
-Python 3.11+. Pre-built wheels for Linux, macOS, Windows.
+PyPI release coming soon. Python 3.11+. Linux, macOS, Windows.
 
 ## Three ways to read
 
