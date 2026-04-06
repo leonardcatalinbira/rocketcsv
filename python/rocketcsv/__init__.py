@@ -123,17 +123,23 @@ class _WriterWrapper:
     #   2 = QUOTE_NONE with escapechar (manual escape, no quoting)
     #   3 = doublequote=False with escapechar (manual escape-in-quotes)
 
+    # _mode 4 = multi-char lineterminator (manual formatting needed)
+
     def __init__(self, inner, dialect_obj, file_obj):
         self._inner = inner
         self.dialect = dialect_obj
         self._file = file_obj
         d = dialect_obj
+        lt = d.lineterminator
+        multichar_lt = lt != "\r\n" and len(lt) > 1
         if d.quoting == QUOTE_NONE and d.escapechar is not None:
             self._mode = 2
         elif d.quoting == QUOTE_NONE and d.escapechar is None:
             self._mode = 1
         elif not d.doublequote and d.escapechar is not None:
             self._mode = 3
+        elif multichar_lt:
+            self._mode = 4
         else:
             self._mode = 0
 
@@ -168,6 +174,28 @@ class _WriterWrapper:
         line = d.delimiter.join(fields) + d.lineterminator
         return self._file.write(line)
 
+    def _manual_writerow_quoteall(self, row):
+        """Mode 4: manual formatting for multi-char lineterminator with standard quoting."""
+        d = self.dialect
+        fields = []
+        for field in row:
+            s = str(field) if field is not None else ""
+            # Apply standard quoting rules
+            need_quote = (
+                d.quoting == QUOTE_ALL
+                or d.delimiter in s
+                or '\r' in s
+                or '\n' in s
+                or (d.quotechar and d.quotechar in s)
+            )
+            if need_quote and d.quotechar:
+                if d.doublequote:
+                    s = s.replace(d.quotechar, d.quotechar + d.quotechar)
+                s = d.quotechar + s + d.quotechar
+            fields.append(s)
+        line = d.delimiter.join(fields) + d.lineterminator
+        return self._file.write(line)
+
     def writerow(self, row):
         if self._mode == 1:
             # QUOTE_NONE, no escapechar — check for chars that need escaping
@@ -184,6 +212,8 @@ class _WriterWrapper:
             return self._inner.writerow(row)
         elif self._mode in (2, 3):
             return self._manual_writerow(row)
+        elif self._mode == 4:
+            return self._manual_writerow_quoteall(row)
         else:
             return self._inner.writerow(row)
 
@@ -200,11 +230,50 @@ def reader(csvfile, dialect=None, **fmtparams):
     kwargs = _resolve_dialect(dialect, fmtparams)
     _validate_params(kwargs)
     dialect_obj = _make_dialect_obj(kwargs)
+
+    # Fall back to stdlib for edge cases the Rust csv crate doesn't handle:
+    # - escapechar in reader (Rust crate handles it differently)
+    # - strict mode (not implemented in Rust)
+    # - multi-char lineterminator (not applicable to reader but filter out)
+    has_escape = kwargs.get("escapechar") is not None
+    has_strict = kwargs.get("strict", False)
+    has_nonnumeric = kwargs.get("quoting") == QUOTE_NONNUMERIC
+    if has_escape or has_strict or has_nonnumeric:
+        import csv as _csv_stdlib
+        stdlib_kwargs = dict(kwargs)
+        stdlib_kwargs.pop("lineterminator", None)
+        r = _csv_stdlib.reader(csvfile, **stdlib_kwargs)
+        # Wrap to add our dialect attribute
+        return _StdlibReaderWrapper(r, dialect_obj)
+
     # Remove params that Rust reader doesn't accept
     kwargs.pop("lineterminator", None)
-    kwargs.pop("strict", None)  # TODO: implement strict mode properly
+    kwargs.pop("strict", None)
     r = _reader_rust(csvfile, **kwargs)
     return _ReaderWrapper(r, dialect_obj)
+
+
+class _StdlibReaderWrapper:
+    """Wraps stdlib csv.reader for edge cases, exposes rocketcsv dialect."""
+    __slots__ = ("_inner", "dialect")
+
+    def __init__(self, inner, dialect_obj):
+        self._inner = inner
+        self.dialect = dialect_obj
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        import csv as _csv_stdlib
+        try:
+            return next(self._inner)
+        except _csv_stdlib.Error as e:
+            raise Error(str(e)) from None
+
+    @property
+    def line_num(self):
+        return self._inner.line_num
 
 
 def writer(csvfile, dialect=None, **fmtparams):
