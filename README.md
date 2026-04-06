@@ -10,20 +10,24 @@ import csv
 import rocketcsv as csv
 ```
 
-Same `reader()`, `writer()`, `DictReader`, `DictWriter`. Same parameters. Same behavior. [376 compatibility tests](BENCHMARKS.md#corpus-shadow-test-results) prove it. Zero API changes, zero refactoring, zero new dependencies to learn.
+Same `reader()`, `writer()`, `DictReader`, `DictWriter`. Same parameters. Same behavior. [376 compatibility tests](BENCHMARKS.md#corpus-shadow-test-results) prove it.
 
-Want more speed? Point rocketcsv at the file path directly:
+**Pass a file path instead of a file object — rocketcsv reads it entirely in Rust:**
 
 ```python
-# 1.7-2.4x faster — reads entirely in Rust, no Python IO
-for row in rocketcsv.reader_from_path("data.csv"):
+import rocketcsv as csv
+
+# Pass a path string → auto-detects, reads in Rust (1.7-2.4x faster)
+for row in csv.reader("data.csv"):
     process(row)
 
-# Even faster — fields stay in Rust, only materialize what you touch
-for row in rocketcsv.fast_reader_from_path("data.csv"):
-    if row[3] == "active":   # only this column is materialized
-        print(row[0])         # and this one — the other 8 are free
+# Still works the classic way too (1.2-1.3x faster)
+with open("data.csv") as f:
+    for row in csv.reader(f):
+        process(row)
 ```
+
+One import change for an instant speedup. Pass a file path for the full Rust fast path. Same function, same API.
 
 ## Benchmarks
 
@@ -93,24 +97,24 @@ with open("out.csv", "w", newline="") as f:
 pip install rocketcsv
 ```
 
-Python 3.9+. Pre-built wheels for Linux, macOS, Windows.
+Python 3.11+. Pre-built wheels for Linux, macOS, Windows.
 
 ## Three ways to read
 
 ```python
-import rocketcsv
-
-# 1. Drop-in — swap one import, change nothing else
 import rocketcsv as csv
-for row in csv.reader(open("data.csv")):  # returns list[str]
+
+# 1. Drop-in — swap one import, change nothing else (1.2-1.3x)
+with open("data.csv") as f:
+    for row in csv.reader(f):
+        process(row)
+
+# 2. Pass a path — auto-detects, reads in Rust (1.7-2.4x)
+for row in csv.reader("data.csv"):
     process(row)
 
-# 2. File path — reads entirely in Rust, skips Python IO
-for row in rocketcsv.reader_from_path("data.csv"):  # returns list[str]
-    process(row)
-
-# 3. Performance mode — lazy rows, zero-cost unused columns
-for row in rocketcsv.fast_reader_from_path("data.csv"):  # returns RocketRow
+# 3. Performance mode — lazy rows, zero-cost unused columns (2.2x)
+for row in rocketcsv.fast_reader_from_path("data.csv"):
     if row[2] == "IT":     # only this field is materialized
         name = row[0]       # and this one
         # row[1], row[3]..row[9] — never allocated

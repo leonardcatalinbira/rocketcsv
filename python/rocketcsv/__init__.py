@@ -271,7 +271,30 @@ class _WriterWrapper:
 
 
 def reader(csvfile, dialect=None, **fmtparams):
-    """Drop-in replacement for csv.reader(). Supports dialect parameter."""
+    """Drop-in replacement for csv.reader(). Supports dialect parameter.
+
+    Accepts file objects, StringIO, iterables, or file paths (str/Path).
+    When a string path is passed, reads entirely in Rust for maximum speed.
+    """
+    # Auto-detect file path: str or pathlib.Path → use Rust file I/O
+    import pathlib
+    if isinstance(csvfile, (str, pathlib.PurePath)):
+        kwargs = _resolve_dialect(dialect, fmtparams)
+        _validate_params(kwargs)
+        dialect_obj = _make_dialect_obj(kwargs)
+        kwargs.pop("lineterminator", None)
+        kwargs.pop("strict", None)
+        has_escape = kwargs.get("escapechar") is not None
+        has_strict = fmtparams.get("strict", False)
+        has_nonnumeric = kwargs.get("quoting") == QUOTE_NONNUMERIC
+        if has_escape or has_strict or has_nonnumeric:
+            import csv as _csv_stdlib
+            stdlib_kwargs = dict(kwargs)
+            r = _csv_stdlib.reader(open(str(csvfile), newline=""), **stdlib_kwargs)
+            return _StdlibReaderWrapper(r, dialect_obj)
+        r = reader_from_path(str(csvfile), **kwargs)
+        return _ReaderWrapper(r, dialect_obj, has_bom=False)
+
     # Validate csvfile is iterable
     if not hasattr(csvfile, '__iter__') and not hasattr(csvfile, 'read'):
         raise Error("argument 1 must be an iterator")
