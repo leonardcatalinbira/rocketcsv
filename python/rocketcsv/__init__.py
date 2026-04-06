@@ -124,23 +124,29 @@ class _WriterWrapper:
 
 def reader(csvfile, dialect=None, **fmtparams):
     """Drop-in replacement for csv.reader(). Supports dialect parameter."""
+    # Validate csvfile is iterable
+    if not hasattr(csvfile, '__iter__') and not hasattr(csvfile, 'read'):
+        raise Error("argument 1 must be an iterator")
     kwargs = _resolve_dialect(dialect, fmtparams)
     _validate_params(kwargs)
-    # Remove lineterminator — reader doesn't use it
+    dialect_obj = _make_dialect_obj(kwargs)
+    # Remove params that Rust reader doesn't accept
     kwargs.pop("lineterminator", None)
     kwargs.pop("strict", None)  # TODO: implement strict mode properly
     r = _reader_rust(csvfile, **kwargs)
-    return _ReaderWrapper(r, _make_dialect_obj(kwargs))
+    return _ReaderWrapper(r, dialect_obj)
 
 
 def writer(csvfile, dialect=None, **fmtparams):
     """Drop-in replacement for csv.writer(). Supports dialect parameter."""
     kwargs = _resolve_dialect(dialect, fmtparams)
     _validate_params(kwargs)
-    # Remove strict — writer doesn't use it
+    dialect_obj = _make_dialect_obj(kwargs)
+    # Remove params that only apply to reader
     kwargs.pop("strict", None)
+    kwargs.pop("skipinitialspace", None)
     w = _writer_rust(csvfile, **kwargs)
-    return _WriterWrapper(w, _make_dialect_obj(kwargs))
+    return _WriterWrapper(w, dialect_obj)
 
 # ---------------------------------------------------------------------------
 # Dialect support (pure Python — not perf-critical)
@@ -279,7 +285,7 @@ class DictReader:
         self._fieldnames = fieldnames
         self.restkey = restkey
         self.restval = restval
-        self.reader = reader(f, *args, **kwds)
+        self.reader = reader(f, dialect=dialect, *args, **kwds)
         self.dialect = dialect
         self.line_num = 0
 
@@ -346,12 +352,12 @@ class DictWriter:
         *args,
         **kwds,
     ):
+        if extrasaction not in ("raise", "ignore"):
+            raise ValueError("extrasaction (%s) must be 'raise' or 'ignore'" % extrasaction)
         self.fieldnames = fieldnames
         self.restval = restval
         self.extrasaction = extrasaction
-        if extrasaction not in ("raise", "ignore"):
-            raise ValueError("extrasaction (%s) must be 'raise' or 'ignore'" % extrasaction)
-        self.writer = writer(f, *args, **kwds)
+        self.writer = writer(f, dialect=dialect, *args, **kwds)
 
     def writeheader(self):
         return self.writer.writerow(self.fieldnames)

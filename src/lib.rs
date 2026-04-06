@@ -65,6 +65,13 @@ impl PyIterableReader {
                 let bytes = line.as_bytes();
                 self.total_bytes_buffered += bytes.len();
                 self.buf.extend_from_slice(bytes);
+                // Ensure lines from iterables are newline-terminated
+                // (stdlib csv.reader expects each item from the iterable
+                // to be a "line" — if it doesn't end with \n, add one)
+                if !bytes.is_empty() && !bytes.ends_with(b"\n") && !bytes.ends_with(b"\r") {
+                    self.buf.push(b'\n');
+                    self.total_bytes_buffered += 1;
+                }
                 Ok(true)
             }
             Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
