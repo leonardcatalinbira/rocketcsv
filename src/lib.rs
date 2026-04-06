@@ -29,6 +29,13 @@ struct PyIterableReader {
 impl PyIterableReader {
     fn new(py: Python<'_>, source: Py<PyAny>) -> PyResult<Self> {
         let is_file_like = source.bind(py).hasattr("read")?;
+        // If not file-like, get an iterator via iter() so lists/tuples work
+        let source = if is_file_like {
+            source
+        } else {
+            let iter_obj = source.call_method0(py, "__iter__")?;
+            iter_obj
+        };
         Ok(Self {
             source,
             is_file_like,
