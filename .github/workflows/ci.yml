@@ -10,6 +10,7 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
@@ -25,11 +26,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
-        run: |
-          pip install maturin pytest hypothesis pytest-benchmark
+        run: pip install maturin pytest
 
-      - name: Build and install
-        run: maturin develop
+      - name: Build wheel
+        run: maturin build --release --out dist
+
+      - name: Install wheel
+        run: pip install --find-links dist rocketcsv --force-reinstall
 
       - name: Run tests
         run: pytest tests/ -x -v
