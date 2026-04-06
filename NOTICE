@@ -1,0 +1,16 @@
+rocketcsv
+Copyright (c) 2026 rocketcsv contributors
+
+This product includes software developed with the following dependencies:
+
+  - csv (Rust crate) by Andrew Gallant (BurntSushi)
+    License: MIT OR Unlicense
+    https://crates.io/crates/csv
+
+  - PyO3
+    License: MIT OR Apache-2.0
+    https://pyo3.rs
+
+  - maturin (build tool, not distributed)
+    License: MIT
+    https://maturin.rs

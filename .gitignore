@@ -1,0 +1,29 @@
+# Claude instruction files
+CLAUDE.md
+.claude-docs/
+
+# Rust build artifacts
+target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.so
+*.pyd
+*.dylib
+.venv/
+*.whl
+
+# Corpus (fetched by script, too large for git)
+corpus/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
